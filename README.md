@@ -10,5 +10,5 @@ There are two main components in this system to manage IBL. The first one is ref
 Mouse/Keyboard:
 - Mouse : Rotate camera (left click on press)
 
- Buttons:
+Buttons:
 * Click buttons to switch different materials and positions
