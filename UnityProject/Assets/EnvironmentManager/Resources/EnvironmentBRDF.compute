@@ -1,0 +1,129 @@
+﻿// A compute shader to compute image-based lighting BRDF coefficients by importance sampling
+// This image-based lighting approximation method is from the SIGGRAPH course note, Real Shading in Unreal Engine 4
+// BRDF coefficients is stored in a 2D texture
+// At run-time, our shader accesses the pre-calculated BRDF coefficients by two inputs:
+// 1.Angle between view and surface normal 
+// 2.Roughness
+
+#pragma kernel CSMain
+
+SamplerState MyLinearClampSampler;	//A sample state with address clamp and linear sampling
+RWTexture2D<float2> gBRDFTex;	//A 2D texture for storing BRDF coefficients
+uint gWidth;					//The size of texture
+
+//--------------------------------------------------------------------------------------
+// Helper functions
+//--------------------------------------------------------------------------------------
+
+// Schlick's approximation for the specular geometric attenuation term
+// G(l,v,h) = G1(l)G1(v)
+float G_Smith(float roughness, float NoV, float NoL)
+{
+	float  k = (roughness*roughness) / 2;
+	return  (NoV / (NoV * (1 - k) + k)) *  (NoL / (NoL * (1 - k) + k));
+}
+
+// Hammersley sequence to generate two-dimensional random numbers
+float radicalInverse_VdC(uint bits) {
+	bits = (bits << 16u) | (bits >> 16u);
+	bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+	bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+	bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+	bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+	return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+float2 hammersley2d(uint i, uint N) {
+	return float2(float(i) / float(N), radicalInverse_VdC(i));
+}
+
+// Sample a vector in a hemisphere
+float3 ImportanceSampleGGX(float2 Xi, float Roughness, float3 N)
+{
+	const float PI = 3.14159;
+	float a = Roughness * Roughness;
+	float Phi = 2 * PI * Xi.x;
+	float CosTheta = sqrt((1 - Xi.y) / (1 + (a*a - 1) * Xi.y));
+	float SinTheta = sqrt(1 - CosTheta * CosTheta);
+	float3 H;
+	H.x = SinTheta * cos(Phi);
+	H.y = SinTheta * sin(Phi);
+	H.z = CosTheta;
+	float3 UpVector = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+	float3 TangentX = normalize(cross(UpVector, N));
+	float3 TangentY = cross(N, TangentX);
+	// Tangent to world space
+	return TangentX * H.x + TangentY * H.y + N * H.z;
+
+}
+
+//--------------------------------------------------------------------------------------
+// Compute shader entry point
+//--------------------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void CSMain(uint3 Gid : SV_GroupID, uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint GI : SV_GroupIndex)
+{
+
+	// Use DispatchThreadID to calculate a 2D coordinate
+	uint v = DTid.x / gWidth;
+	uint u = DTid.x%gWidth;
+
+	// The total sampling number
+	const int smapleNum = 2048;
+
+	// Initialize variables
+	float3 PrefilteredColor = 0;
+	float TotalWeight = 0;
+	float invImgSize = 1 / (float)gWidth;
+	float A = 0;
+	float B = 0;
+
+	// Use u coordinate to map a NOV value, mapping [0~TextureSize-1] to [0~1]
+	float NoV = invImgSize*u;
+
+	// When N dot V is zero, there is a big change between a small value and zero such as 0.0001f to 0.0f
+	// I add a epsilon to avoid this problem when NOV=0
+	if (NoV == 0.0f)
+	{
+		NoV += invImgSize / 2;
+	}
+
+	// Use v coordinate to map a Roughness value, mapping [0~TextureSize-1] to [0~1]
+	float Roughness = invImgSize*v;
+
+	// Use NoV to compute view vector
+	float3 V;
+	V.x = sqrt(1.0f - NoV * NoV);
+	V.y = 0;
+	V.z = NoV;
+
+	// While NOV is 1, the view vector is (0,0,1). The normal should be the same as the view vector(0,0,1).
+	float3 N = float3(0, 0, 1);
+
+	//Loop every sample
+	for (int i = 0; i < smapleNum; i++)
+	{
+		// Get a random number
+		float2 Xi = hammersley2d(i, smapleNum);
+
+		// Sample a half vector to calculate a light vector
+		float3 H = ImportanceSampleGGX(Xi, Roughness, N);
+		float3 L = 2 * dot(V, H) * H - V;
+		float NoL = saturate(L.z);
+		float NoH = saturate(H.z);
+		float VoH = saturate(dot(V, H));
+
+		// Use Schlick's approximation for Fresnel term and geometric attenuation term
+		if (NoL > 0)
+		{
+			float G = G_Smith(Roughness, NoV, NoL);
+			float G_Vis = G * VoH / (NoH * NoV);
+			float Fc = pow(1 - VoH, 5);
+			A += (1 - Fc) * G_Vis;
+			B += Fc * G_Vis;
+		}
+
+	}
+
+	// Save the result to a 2D texture
+	gBRDFTex[uint2(u, v)] = float2(A, B) / smapleNum;
+}

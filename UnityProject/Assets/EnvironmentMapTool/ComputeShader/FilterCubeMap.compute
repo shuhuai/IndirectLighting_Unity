@@ -1,0 +1,154 @@
+﻿// A compute shader to filter environment maps for image-based lighting by importance sampling.
+// This image-based lighting approximation method is from the SIGGRAPH course note, Real Shading in Unreal Engine 4.
+// For different roughness, this shader stores data to mipmap levels of a cubemap, and this cubemap is for the integral of image-based lighting.
+// At run-time, our shader accesses cubemaps by two inputs:
+// 1.Reflection angle.
+// 2.Roughness.
+
+#pragma kernel CSMain
+
+
+SamplerState MyLinearClampSampler
+{
+	Filter = MIN_MAG_MIP_LINEAR;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+RWStructuredBuffer<float4> gOutput;			//Output buffer.
+StructuredBuffer<float3> sgFace2DMapping;	//A constant array to access a cubemap.
+TextureCube gCubemap;						//Cubemap source.
+uint gWidth;								//Cubemap size.
+float gRoughness;							//Roughness value for a mipmap level.
+
+//--------------------------------------------------------------------------------------
+// Helper functions
+//--------------------------------------------------------------------------------------
+
+// Hammersley sequence to generate two-dimensional random numbers.
+float radicalInverse_VdC(uint bits) {
+	bits = (bits << 16u) | (bits >> 16u);
+	bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+	bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+	bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+	bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+	return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+
+float2 hammersley2d(uint i, uint N) {
+	return float2(float(i) / float(N), radicalInverse_VdC(i));
+}
+
+// Sample a vector in a hemisphere.
+float3 ImportanceSampleGGX(float2 Xi, float Roughness, float3 N)
+{
+	const float PI = 3.14159;
+	float a = Roughness * Roughness;
+	float Phi = 2 * PI * Xi.x;
+	float CosTheta = sqrt((1 - Xi.y) / (1 + (a*a - 1) * Xi.y));
+	float SinTheta = sqrt(1 - CosTheta * CosTheta);
+	float3 H;
+	H.x = SinTheta * cos(Phi);
+	H.y = SinTheta * sin(Phi);
+	H.z = CosTheta;
+	float3 UpVector = abs(N.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+	float3 TangentX = normalize(cross(UpVector, N));
+	float3 TangentY = cross(N, TangentX);
+	// Tangent to world space.
+	return TangentX * H.x + TangentY * H.y + N * H.z;
+
+}
+
+// Compute a vector for a texel of cubemap.
+float3 TexelCoordToVect(int a_FaceIdx, float a_U, float a_V, int a_Size)
+{
+	float nvcU, nvcV;
+	float3 output, tempVec;
+
+
+	// transform from [0..a_Size - 1] to [-1 .. 1]
+	// + 0.5f is for texel center addressing
+	nvcU = (2.0f * (a_U + 0.5f) / (float)a_Size) - 1.0f;
+	nvcV = (2.0f * (a_V + 0.5f) / (float)a_Size) - 1.0f;
+
+
+	output = sgFace2DMapping[a_FaceIdx * 3] * nvcU;
+
+
+
+	tempVec = sgFace2DMapping[a_FaceIdx * 3 + 1];
+	tempVec = tempVec*nvcV;
+	output = output + tempVec;
+
+	tempVec = sgFace2DMapping[a_FaceIdx * 3 + 2];
+	output = output + tempVec;
+
+
+
+
+	return normalize(output);
+}
+
+// A power function.
+float3 myPow(float3 a, float b)
+{
+	return exp(b * log(a));
+}
+
+//--------------------------------------------------------------------------------------
+// Compute shader entry point
+//--------------------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void CSMain(uint3 Gid : SV_GroupID, uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint GI : SV_GroupIndex)
+{
+
+	// Use DispatchThreadID to calculate a coordinate of cubemap.
+	uint face = DTid.x / (gWidth*gWidth);
+	uint temp = DTid.x % (gWidth*gWidth);
+	uint v = temp / gWidth;
+	uint u = temp%gWidth;
+
+	// The total sampling number.
+	const int smapleNum = 1024;
+
+	// Initialize variables.
+	float3 PrefilteredColor = 0;
+	float TotalWeight = 0;
+
+	// Use face index, u,v coordinate to compute a vector.
+	float3 centerTapDir = TexelCoordToVect(face, (float)u, (float)v, gWidth);
+
+	float3 N = centerTapDir;
+	float3 V = centerTapDir;
+
+	// Loop every sample.
+	for (int i = 0; i < smapleNum; i++)
+	{
+		// Get a random number.
+		float2 Xi = hammersley2d(i, smapleNum);
+		// Sample a half vector, so we can get light vector.
+		float3 H = ImportanceSampleGGX(Xi, gRoughness, centerTapDir);
+
+		float3 L = 2 * dot(V, H) * H - V;
+		float NoL = saturate(dot(N, L));
+
+		// Sum the weights and colors.
+		if (NoL > 0)
+		{
+			PrefilteredColor += gCubemap.SampleLevel(MyLinearClampSampler, L, 0).rgb * NoL;
+			TotalWeight += NoL;
+		}
+
+
+	}
+
+	// Average the accumulated sum.
+	PrefilteredColor = PrefilteredColor / TotalWeight;
+	if (TotalWeight == 0)
+	{
+		PrefilteredColor = gCubemap.SampleLevel(MyLinearClampSampler, centerTapDir, 0).rgb;
+	}
+
+	gOutput[DTid.x] = float4((PrefilteredColor.xyz), 1);
+
+}
